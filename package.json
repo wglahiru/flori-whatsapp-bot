@@ -1,0 +1,23 @@
+{
+  "name": "whatsapp-service",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc13",
+    "archiver": "^7.0.1",
+    "axios": "^1.7.2",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "extract-zip": "^2.0.1",
+    "form-data": "^4.0.0",
+    "pino": "^10.3.1",
+    "qrcode": "^1.5.4"
+  }
+}
