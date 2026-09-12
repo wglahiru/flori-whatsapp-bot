@@ -1,22 +1,20 @@
-FROM ghcr.io/puppeteer/puppeteer:21.5.0
+FROM node:20-slim
 
-# Set working directory
-WORKDIR /usr/src/app
+WORKDIR /app
 
 # Copy package files
-COPY --chown=pptruser:pptruser package*.json ./
+COPY package*.json ./
 
 # Install dependencies
-RUN npm install
+RUN npm install --omit=dev
 
 # Copy source code
-COPY --chown=pptruser:pptruser . .
+COPY . .
 
-# Expose port
-EXPOSE 3001
+# Default port
+EXPOSE 10000
 
-# Environment variable for port
-ENV PORT=3001
+ENV PORT=10000
 
 # Command to run
 CMD [ "node", "server.js" ]

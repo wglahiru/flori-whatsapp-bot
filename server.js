@@ -103,9 +103,17 @@ async function loadSessionFromRemote() {
             fs.writeFileSync(ZIP_FILE, Buffer.from(response.data));
             const targetDir = path.resolve(SESSION_DIR);
             
-            console.log(`Session downloaded (${response.data.length} bytes). Extracting to ${targetDir}...`);
-            await extractZip(ZIP_FILE, { dir: targetDir });
-            console.log('Session extracted successfully.');
+            try {
+                console.log(`Session downloaded (${response.data.length} bytes). Extracting to ${targetDir}...`);
+                await extractZip(ZIP_FILE, { dir: targetDir });
+                console.log('Session extracted successfully.');
+            } catch (extErr) {
+                console.error('Error extracting zip session:', extErr.message);
+                if (fs.existsSync(targetDir)) {
+                    try { fs.rmSync(targetDir, { recursive: true, force: true }); } catch (e) {}
+                }
+                await deleteSessionOnRemote();
+            }
 
             // Validate that the extracted session is actually registered and valid
             const credsFile = path.join(targetDir, 'creds.json');
@@ -237,12 +245,17 @@ async function connectToWhatsApp() {
 }
 
 async function initializeClient() {
-    // 1. Fetch remote session first
-    await loadSessionFromRemote();
-    
-    // 2. Initialize WhatsApp Client
-    console.log('Initializing WhatsApp client...');
-    connectToWhatsApp();
+    try {
+        // 1. Fetch remote session first
+        await loadSessionFromRemote();
+        
+        // 2. Initialize WhatsApp Client
+        console.log('Initializing WhatsApp client...');
+        await connectToWhatsApp();
+    } catch (fatalErr) {
+        console.error('Fatal initialization error:', fatalErr.message);
+        setTimeout(initializeClient, 10000);
+    }
 }
 
 // Check Status & QR endpoint
@@ -395,4 +408,13 @@ app.get('/api/save-session', async (req, res) => {
 app.listen(port, () => {
     console.log(`WhatsApp API Microservice listening at http://localhost:${port}`);
     initializeClient();
+});
+
+// Global crash handlers so node never exits with status 1
+process.on('uncaughtException', (err) => {
+    console.error('CRITICAL: Uncaught Exception in WhatsApp Service:', err.message, err.stack);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('CRITICAL: Unhandled Rejection in WhatsApp Service:', reason);
 });
