@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const { 
     default: makeWASocket, 
     useMultiFileAuthState, 
@@ -115,18 +115,16 @@ async function loadSessionFromRemote() {
                 await deleteSessionOnRemote();
             }
 
-            // Validate that the extracted session is actually registered and valid
+            // Inspect creds.json for logging
             const credsFile = path.join(targetDir, 'creds.json');
             if (fs.existsSync(credsFile)) {
                 try {
                     const creds = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
-                    if (creds && creds.me && creds.registered === false) {
-                        console.log('Downloaded session is invalid/unregistered (creds.registered is false). Purging...');
-                        fs.rmSync(targetDir, { recursive: true, force: true });
-                        await deleteSessionOnRemote();
+                    if (creds && creds.me) {
+                        console.log('Valid saved session found for account:', creds.me.id || creds.me.name);
                     }
                 } catch (err) {
-                    console.log('Error inspecting creds.json:', err.message);
+                    console.log('Error reading creds.json:', err.message);
                 }
             }
         } else {
@@ -146,7 +144,16 @@ async function connectToWhatsApp() {
     isConnecting = true;
 
     try {
-        // 1. Fetch latest WhatsApp Web version to prevent 405 Method Not Allowed / Client Out of Date errors
+        // Clean up any existing socket listeners
+        if (sock) {
+            try {
+                sock.ev.removeAllListeners();
+                sock.end();
+            } catch (e) {}
+            sock = null;
+        }
+
+        // 1. Fetch latest WhatsApp Web version to prevent 405 Method Not Allowed
         let version;
         try {
             const versionInfo = await fetchLatestBaileysVersion();
@@ -160,27 +167,16 @@ async function connectToWhatsApp() {
         // 2. Load auth state
         let { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
 
-        // Sanity check: if creds has .me but registered is false, it's a dead session
-        if (state.creds && state.creds.me && state.creds.registered === false) {
-            console.log('Corrupted session detected (me set but registered: false). Wiping and creating fresh...');
-            if (fs.existsSync(SESSION_DIR)) {
-                fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-            }
-            await deleteSessionOnRemote();
-            const fresh = await useMultiFileAuthState(SESSION_DIR);
-            state = fresh.state;
-            saveCreds = fresh.saveCreds;
-        }
-
         // 3. Create Socket
         sock = makeWASocket({
             version,
             auth: state,
             printQRInTerminal: false,
             logger: pino({ level: 'silent' }),
-            browser: Browsers.ubuntu('Chrome'),
+            browser: Browsers.macOS('Desktop'),
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 25000,
         });
 
         // 4. Listen for Connection Updates
@@ -201,13 +197,19 @@ async function connectToWhatsApp() {
                 isConnecting = false;
                 const statusCode = (lastDisconnect?.error)?.output?.statusCode;
                 console.log('Connection closed. Code:', statusCode, 'Error:', lastDisconnect?.error?.message);
-                clientStatus = 'disconnected';
-                
-                // Check if logged out, unauthorized, or client version blocked
-                const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403 || statusCode === 405;
-                
-                if (isLoggedOut) {
+
+                // In Baileys, code 515 is DisconnectReason.restartRequired.
+                // This ALWAYS happens right after scanning QR code to complete pairing handshake.
+                const isRestartRequired = statusCode === 515 || statusCode === DisconnectReason.restartRequired;
+                const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403;
+
+                if (isRestartRequired) {
+                    console.log('Restart required (pairing handshake). Reconnecting immediately...');
+                    clientStatus = 'authenticating';
+                    setTimeout(connectToWhatsApp, 1500);
+                } else if (isLoggedOut) {
                     console.log('Session logged out or expired. Wiping session and preparing fresh QR...');
+                    clientStatus = 'disconnected';
                     qrCodeData = null;
                     if (fs.existsSync(SESSION_DIR)) {
                         fs.rmSync(SESSION_DIR, { recursive: true, force: true });
@@ -215,8 +217,9 @@ async function connectToWhatsApp() {
                     await deleteSessionOnRemote();
                     setTimeout(connectToWhatsApp, 2000);
                 } else {
-                    // Reconnect on transient disconnects
-                    setTimeout(connectToWhatsApp, 5000);
+                    // Reconnect on transient network drop or temporary disconnect
+                    console.log('Transient disconnect. Reconnecting in 4s...');
+                    setTimeout(connectToWhatsApp, 4000);
                 }
             } else if (connection === 'open') {
                 isConnecting = false;
@@ -224,7 +227,8 @@ async function connectToWhatsApp() {
                 clientStatus = 'connected';
                 qrCodeData = null;
                 
-                // Save session to flori.lk
+                // Immediately save creds and upload session to flori.lk
+                await saveCreds();
                 await saveSessionToRemote();
             }
         });
@@ -233,7 +237,7 @@ async function connectToWhatsApp() {
             await saveCreds();
             if (clientStatus === 'connected') {
                 if (saveTimeout) clearTimeout(saveTimeout);
-                saveTimeout = setTimeout(saveSessionToRemote, 10000);
+                saveTimeout = setTimeout(saveSessionToRemote, 5000);
             }
         });
 
@@ -336,7 +340,7 @@ app.get('/api/qr', (req, res) => {
             </head>
             <body style="font-family: system-ui, sans-serif; text-align: center; padding: 40px 20px; background: #f9fafb;">
                 <div style="display: inline-block; padding: 25px; background: white; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); max-width: 320px;">
-                    <div style="font-size: 32px; margin-bottom: 15px; animation: spin 2s linear infinite;">⏳</div>
+                    <div style="font-size: 32px; margin-bottom: 15px;">⏳</div>
                     <h3 style="color: #1f2937; margin: 0 0 8px 0; font-size: 18px;">Generating QR Code...</h3>
                     <p style="color: #6b7280; font-size: 13px; line-height: 1.5; margin: 0;">Connecting to WhatsApp servers. This page will automatically refresh every 3 seconds.</p>
                 </div>
