@@ -1,9 +1,10 @@
-﻿const express = require('express');
+const express = require('express');
 const { 
     default: makeWASocket, 
     useMultiFileAuthState, 
     DisconnectReason, 
     Browsers, 
+    fetchLatestWaWebVersion,
     fetchLatestBaileysVersion 
 } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode');
@@ -31,7 +32,43 @@ let clientStatus = 'disconnected'; // 'disconnected', 'authenticating', 'connect
 let isSavingSession = false;
 let sock = null;
 let saveTimeout = null;
+let reconnectTimeout = null;
 let isConnecting = false;
+
+// Dynamic WhatsApp Web version resolver
+async function getWaVersion() {
+    try {
+        if (typeof fetchLatestWaWebVersion === 'function') {
+            const v = await fetchLatestWaWebVersion();
+            if (v && v.version) {
+                console.log('Fetched WA Web version via Baileys:', v.version);
+                return v.version;
+            }
+        }
+    } catch (e) {}
+
+    try {
+        const res = await axios.get('https://web.whatsapp.com/check-update?version=1.0.0&platform=web', { timeout: 6000 });
+        if (res.data && res.data.currentVersion) {
+            const parts = res.data.currentVersion.split('.').map(Number);
+            if (parts.length === 3) {
+                console.log('Fetched WA Web version via web.whatsapp.com:', parts);
+                return parts;
+            }
+        }
+    } catch (e) {}
+
+    try {
+        const vInfo = await fetchLatestBaileysVersion();
+        if (vInfo && vInfo.version) {
+            console.log('Fallback WA Web version via Baileys defaults:', vInfo.version);
+            return vInfo.version;
+        }
+    } catch (e) {}
+
+    console.log('Using Baileys internal default WA Web version');
+    return undefined;
+}
 
 // Delete session on flori.lk remote server
 async function deleteSessionOnRemote() {
@@ -139,6 +176,14 @@ async function loadSessionFromRemote() {
     }
 }
 
+function scheduleReconnect(delayMs) {
+    if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    reconnectTimeout = setTimeout(() => {
+        reconnectTimeout = null;
+        connectToWhatsApp();
+    }, delayMs);
+}
+
 async function connectToWhatsApp() {
     if (isConnecting) return;
     isConnecting = true;
@@ -153,31 +198,27 @@ async function connectToWhatsApp() {
             sock = null;
         }
 
-        // 1. Fetch latest WhatsApp Web version to prevent 405 Method Not Allowed
-        let version;
-        try {
-            const versionInfo = await fetchLatestBaileysVersion();
-            version = versionInfo.version;
-            console.log('Using WhatsApp Web version:', version);
-        } catch (e) {
-            console.log('Failed to fetch latest WA version, using fallback:', e.message);
-            version = [2, 3000, 1043857760];
-        }
+        // 1. Get current WhatsApp Web version dynamically
+        const version = await getWaVersion();
 
         // 2. Load auth state
         let { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
 
         // 3. Create Socket
-        sock = makeWASocket({
-            version,
+        const socketConfig = {
             auth: state,
             printQRInTerminal: false,
             logger: pino({ level: 'silent' }),
-            browser: Browsers.macOS('Desktop'),
+            browser: Browsers.ubuntu('Chrome'),
             connectTimeoutMs: 60000,
             defaultQueryTimeoutMs: 60000,
-            keepAliveIntervalMs: 25000,
-        });
+        };
+
+        if (version) {
+            socketConfig.version = version;
+        }
+
+        sock = makeWASocket(socketConfig);
 
         // 4. Listen for Connection Updates
         sock.ev.on('connection.update', async (update) => {
@@ -186,6 +227,7 @@ async function connectToWhatsApp() {
             if (qr) {
                 console.log('New QR Code generated successfully.');
                 clientStatus = 'disconnected';
+                isConnecting = false;
                 qrcode.toDataURL(qr, (err, url) => {
                     if (!err) {
                         qrCodeData = url;
@@ -198,15 +240,14 @@ async function connectToWhatsApp() {
                 const statusCode = (lastDisconnect?.error)?.output?.statusCode;
                 console.log('Connection closed. Code:', statusCode, 'Error:', lastDisconnect?.error?.message);
 
-                // In Baileys, code 515 is DisconnectReason.restartRequired.
-                // This ALWAYS happens right after scanning QR code to complete pairing handshake.
                 const isRestartRequired = statusCode === 515 || statusCode === DisconnectReason.restartRequired;
                 const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403;
+                const isPreconditionRequired = statusCode === 428;
 
                 if (isRestartRequired) {
-                    console.log('Restart required (pairing handshake). Reconnecting immediately...');
+                    console.log('Restart required (pairing handshake). Reconnecting in 1.5s...');
                     clientStatus = 'authenticating';
-                    setTimeout(connectToWhatsApp, 1500);
+                    scheduleReconnect(1500);
                 } else if (isLoggedOut) {
                     console.log('Session logged out or expired. Wiping session and preparing fresh QR...');
                     clientStatus = 'disconnected';
@@ -215,11 +256,15 @@ async function connectToWhatsApp() {
                         fs.rmSync(SESSION_DIR, { recursive: true, force: true });
                     }
                     await deleteSessionOnRemote();
-                    setTimeout(connectToWhatsApp, 2000);
+                    scheduleReconnect(2000);
+                } else if (isPreconditionRequired) {
+                    console.log('Connection terminated (Code 428). Cooling off for 12 seconds before retry...');
+                    clientStatus = 'disconnected';
+                    qrCodeData = null;
+                    scheduleReconnect(12000);
                 } else {
-                    // Reconnect on transient network drop or temporary disconnect
-                    console.log('Transient disconnect. Reconnecting in 4s...');
-                    setTimeout(connectToWhatsApp, 4000);
+                    console.log('Transient disconnect. Reconnecting in 6s...');
+                    scheduleReconnect(6000);
                 }
             } else if (connection === 'open') {
                 isConnecting = false;
@@ -227,7 +272,6 @@ async function connectToWhatsApp() {
                 clientStatus = 'connected';
                 qrCodeData = null;
                 
-                // Immediately save creds and upload session to flori.lk
                 await saveCreds();
                 await saveSessionToRemote();
             }
@@ -244,16 +288,13 @@ async function connectToWhatsApp() {
     } catch (err) {
         isConnecting = false;
         console.error('Error in connectToWhatsApp:', err.message);
-        setTimeout(connectToWhatsApp, 5000);
+        scheduleReconnect(6000);
     }
 }
 
 async function initializeClient() {
     try {
-        // 1. Fetch remote session first
         await loadSessionFromRemote();
-        
-        // 2. Initialize WhatsApp Client
         console.log('Initializing WhatsApp client...');
         await connectToWhatsApp();
     } catch (fatalErr) {
@@ -283,6 +324,11 @@ app.all('/api/reset', async (req, res) => {
         clientStatus = 'disconnected';
         isConnecting = false;
 
+        if (reconnectTimeout) {
+            clearTimeout(reconnectTimeout);
+            reconnectTimeout = null;
+        }
+
         if (sock) {
             try {
                 sock.ev.removeAllListeners();
@@ -297,7 +343,7 @@ app.all('/api/reset', async (req, res) => {
 
         await deleteSessionOnRemote();
 
-        setTimeout(connectToWhatsApp, 1500);
+        scheduleReconnect(1500);
 
         res.json({
             success: true,
@@ -383,7 +429,6 @@ app.post('/api/send', async (req, res) => {
     }
 
     try {
-        // Format number: e.g., 0771234567 -> 94771234567@s.whatsapp.net
         let cleanedNumber = number.toString().replace(/[^0-9]/g, '');
         if (cleanedNumber.startsWith('0')) {
             cleanedNumber = '94' + cleanedNumber.substring(1);
@@ -414,7 +459,7 @@ app.listen(port, () => {
     initializeClient();
 });
 
-// Global crash handlers so node never exits with status 1
+// Global crash handlers
 process.on('uncaughtException', (err) => {
     console.error('CRITICAL: Uncaught Exception in WhatsApp Service:', err.message, err.stack);
 });
